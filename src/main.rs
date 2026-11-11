@@ -1,596 +1,265 @@
-//! Wireless Display for Linux
-//! WD-005: XDG Desktop Portal -> PipeWire -> GStreamer
-//!
-//! Diagnostic prototype:
-//! - Creates a ScreenCast session.
-//! - Requests a virtual monitor.
-//! - Connects to PipeWire.
-//! - Captures frames for 15 seconds.
-//! - Reports the number of captured frames.
-//!
-//! Network streaming and video encoding are not implemented yet.
+//! WD-005.2: KDE virtual ScreenCast monitor -> PipeWire -> GStreamer.
+//! This is a diagnostic capture host. No TV transport or encoder yet.
 
-use gio::prelude::*;
-use glib::{
-    variant::{ObjectPath, ToVariant},
-    MainLoop, Variant, VariantDict,
-};
-use gstreamer as gst;
+mod capture;
+mod portal;
+
+use capture::{Capture, Stats};
 use gst::prelude::*;
-
+use gstreamer as gst;
 use std::{
     cell::RefCell,
-    os::fd::IntoRawFd,
     rc::Rc,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
-const BUS: &str = "org.freedesktop.portal.Desktop";
-const DESKTOP: &str = "/org/freedesktop/portal/desktop";
-const SCREENCAST: &str = "org.freedesktop.portal.ScreenCast";
+const CAPTURE_SECONDS: u64 = 15;
+const CONNECTION_TIMEOUT_SECONDS: u64 = 45;
 
-const TEST_DURATION: u64 = 15;
-
-fn token() -> String {
-    format!("ruden_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn options(pairs: &[(&str, Variant)]) -> Variant {
-    let dict = VariantDict::new(None);
-
-    for (key, value) in pairs {
-        dict.insert_value(key, value);
-    }
-
-    dict.end()
-}
-
-// Preserve the actual GVariant types of tuple elements.
-// For example: (a{sv}), (oa{sv}) and (osa{sv}).
-fn arguments(values: Vec<Variant>) -> Variant {
-    Variant::tuple_from_iter(values)
-}
-
-fn session_path(path: &str) -> Result<Variant, glib::Error> {
-    let path = ObjectPath::try_from(path).map_err(|_| {
-        glib::Error::new(
-            gio::IOErrorEnum::InvalidArgument,
-            "Неверный D-Bus путь Portal-сессии",
-        )
-    })?;
-
-    Ok(path.to_variant())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Create,
+    Select,
+    Start,
+    Capturing,
+    Finished,
 }
 
 struct App {
-    bus: gio::DBusConnection,
-    main_loop: MainLoop,
-
-    session: Option<String>,
+    portal: portal::Portal,
+    loop_: glib::MainLoop,
     request: Option<String>,
-    stage: &'static str,
-
-    pipeline: Option<gst::Pipeline>,
-    bus_watch: Option<gst::bus::BusWatchGuard>,
-    pipewire_fd: Option<i32>,
-
-    frames: Arc<AtomicU64>,
-    started: Option<Instant>,
-    first_frame: Arc<Mutex<Option<Instant>>>,
-
-    stopped: bool,
+    stage: Stage,
+    capture: Option<Capture>,
+    stats: Arc<Stats>,
+    capture_started: Option<Instant>,
 }
 
 impl App {
-    fn call(
-        &self,
-        name: &str,
-        arguments: Variant,
-    ) -> Result<String, glib::Error> {
-        let reply = self.bus.call_sync(
-            Some(BUS),
-                                       DESKTOP,
-                                       SCREENCAST,
-                                       name,
-                                       Some(&arguments),
-                                       None,
-                                       gio::DBusCallFlags::NONE,
-                                       10_000,
-                                       gio::Cancellable::NONE,
-        )?;
-
-        Ok(reply
-        .child_value(0)
-        .str()
-        .unwrap_or_default()
-        .to_owned())
+    fn fail(&mut self, context: &str, error: impl std::fmt::Display) {
+        eprintln!("[ERROR] {context}: {error}");
+        self.finish();
     }
 
-    fn create(&mut self) -> Result<(), glib::Error> {
-        println!("[1/4] Создание ScreenCast-сессии...");
-
-        self.stage = "create";
-
-        let params = arguments(vec![
-            options(&[
-                ("handle_token", token().to_variant()),
-                    ("session_handle_token", token().to_variant()),
-            ]),
-        ]);
-
-        self.request = Some(self.call("CreateSession", params)?);
-
-        Ok(())
-    }
-
-    fn select(&mut self) -> Result<(), glib::Error> {
-        println!("[2/4] Запрос виртуального дисплея...");
-
-        self.stage = "select";
-
-        let session = self
-        .session
-        .as_ref()
-        .expect("Portal session missing");
-
-        let params = arguments(vec![
-            session_path(session)?,
-                               options(&[
-                                   ("handle_token", token().to_variant()),
-                                       ("types", 4u32.to_variant()),
-                                       ("cursor_mode", 2u32.to_variant()),
-                                       ("multiple", false.to_variant()),
-                               ]),
-        ]);
-
-        self.request = Some(self.call("SelectSources", params)?);
-
-        Ok(())
-    }
-
-    fn start(&mut self) -> Result<(), glib::Error> {
-        println!("[3/4] Запуск виртуального дисплея...");
-        println!("[INFO] Подтверди запрос KDE, если появится окно.");
-
-        self.stage = "start";
-
-        let session = self
-        .session
-        .as_ref()
-        .expect("Portal session missing");
-
-        let params = arguments(vec![
-            session_path(session)?,
-                               "".to_variant(),
-                               options(&[
-                                   ("handle_token", token().to_variant()),
-                               ]),
-        ]);
-
-        self.request = Some(self.call("Start", params)?);
-
-        Ok(())
-    }
-
-    fn close(&mut self) {
-        if self.stopped {
+    fn finish(&mut self) {
+        if self.stage == Stage::Finished {
             return;
         }
-
-        self.stopped = true;
-
-        if let Some(pipeline) = self.pipeline.take() {
-            let _ = pipeline.set_state(gst::State::Null);
+        self.stage = Stage::Finished;
+        self.request = None;
+        if let Some(capture) = self.capture.take() {
+            capture.stop();
         }
-
-        // Keep the GStreamer bus watch alive until shutdown.
-        self.bus_watch.take();
-
-        if let Some(fd) = self.pipewire_fd.take() {
-            // SAFETY: This file descriptor is owned by App
-            // after into_raw_fd() and is closed only once.
-            unsafe {
-                libc::close(fd);
-            }
-        }
-
-        if let Some(session) = self.session.take() {
-            let _ = self.bus.call_sync(
-                Some(BUS),
-                                       &session,
-                                       "org.freedesktop.portal.Session",
-                                       "Close",
-                                       None,
-                                       None,
-                                       gio::DBusCallFlags::NONE,
-                                       3_000,
-                                       gio::Cancellable::NONE,
-            );
-
-            println!("[OK] Portal-сессия закрыта.");
-        }
-
-        self.main_loop.quit();
+        self.portal.close();
+        self.stats.report();
+        self.loop_.quit();
     }
 
-    fn report(&mut self) {
-        let seconds = self
-        .started
-        .map(|time| time.elapsed().as_secs_f64())
-        .unwrap_or(0.0);
-
-        let frames = self.frames.load(Ordering::Relaxed);
-
-        let first_frame = *self
-        .first_frame
-        .lock()
-        .expect("First frame mutex poisoned");
-
-        let fps = first_frame
-        .map(|time| {
-            frames as f64 / time.elapsed().as_secs_f64().max(0.001)
-        })
-        .unwrap_or(0.0);
-
-        println!();
-        println!("========== WD-005 / RUST ==========");
-        println!("Продолжительность: {seconds:.2} с");
-        println!("Получено кадров: {frames}");
-        println!("Средний FPS: {fps:.2}");
-
-        if frames > 0 {
-            println!("Статус: ВИДЕОКАДРЫ ПОЛУЧЕНЫ");
-        } else {
-            println!("Статус: КАДРЫ НЕ ПОЛУЧЕНЫ");
+    fn next(&mut self, stage: Stage, request: portal::Result<String>) {
+        match request {
+            Ok(path) => {
+                self.stage = stage;
+                self.request = Some(path);
+            }
+            Err(error) => self.fail("Portal request", error),
         }
+    }
 
-        println!("===================================");
-
-        self.close();
+    fn handle_response(
+        &mut self,
+        path: &str,
+        parameters: &glib::Variant,
+    ) -> portal::Result<Option<u32>> {
+        if self.request.as_deref() != Some(path) || self.stage == Stage::Finished {
+            return Ok(None);
+        }
+        let (status, result) = portal::parse_response(parameters)?;
+        if status != 0 {
+            return Err(format!(
+                "Portal отклонил этап {:?}, код {status} (1 — отмена)",
+                self.stage
+            ));
+        }
+        match self.stage {
+            Stage::Create => {
+                self.portal.session = Some(portal::session_from_response(&result)?);
+                println!("[1/4] [OK] ScreenCast-сессия создана");
+                let request = self.portal.select_sources();
+                self.next(Stage::Select, request);
+                Ok(None)
+            }
+            Stage::Select => {
+                println!("[2/4] [OK] Виртуальный источник выбран");
+                let request = self.portal.start();
+                self.next(Stage::Start, request);
+                Ok(None)
+            }
+            Stage::Start => {
+                let (node_id, data) = portal::stream_from_response(&result)?;
+                println!("[3/4] [OK] Виртуальный монитор: {data}");
+                self.stage = Stage::Capturing;
+                self.request = None;
+                Ok(Some(node_id))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
-fn capture(
-    app: Rc<RefCell<App>>,
-    state: &mut App,
-    stream_id: u32,
-) -> Result<(), glib::Error> {
-    println!("[4/4] Подключение к PipeWire...");
+fn begin_capture(app: Rc<RefCell<App>>, node_id: u32) -> Result<(), String> {
+    let (remote, stats) = {
+        let state = app.borrow();
+        (state.portal.open_pipewire()?, state.stats.clone())
+    };
+    println!("[4/4] PipeWire remote открыт; node ID = {node_id}");
 
-    let session = state
-    .session
-    .as_ref()
-    .expect("Portal session missing");
-
-    let params = arguments(vec![
-        session_path(session)?,
-                           options(&[]),
-    ]);
-
-    let (reply, fd_list) = state.bus.call_with_unix_fd_list_sync(
-        Some(BUS),
-                                                                 DESKTOP,
-                                                                 SCREENCAST,
-                                                                 "OpenPipeWireRemote",
-                                                                 Some(&params),
-                                                                 None,
-                                                                 gio::DBusCallFlags::NONE,
-                                                                 10_000,
-                                                                 None::<&gio::UnixFDList>,
-                                                                 gio::Cancellable::NONE,
-    )?;
-
-    let index: i32 = reply
-    .child_value(0)
-    .get()
-    .unwrap_or(-1);
-
-    let fd = fd_list
-    .as_ref()
-    .ok_or_else(|| {
-        glib::Error::new(
-            gio::IOErrorEnum::Failed,
-            "Portal не вернул список файловых дескрипторов",
-        )
-    })?
-    .get(index)?;
-
-    let raw_fd = fd.into_raw_fd();
-
-    println!("[OK] PipeWire FD: {raw_fd}");
-
-    state.pipewire_fd = Some(raw_fd);
-
-    let pipeline_description = concat!(
-        "pipewiresrc name=source do-timestamp=true ",
-        "! videoconvert ",
-        "! video/x-raw,format=RGB ",
-        "! appsink name=sink ",
-        "emit-signals=true ",
-        "sync=false ",
-        "max-buffers=2 ",
-        "drop=true"
-    );
-
-    let element = gst::parse::launch(pipeline_description)
-    .map_err(|error| {
-        glib::Error::new(
-            gio::IOErrorEnum::Failed,
-            &error.to_string(),
-        )
+    let mut capture = Capture::new(remote, node_id, stats)?;
+    let on_error = app.clone();
+    capture.watch_errors(move |error| {
+        // Events arrive on the GLib thread. Close only once.
+        on_error.borrow_mut().fail("GStreamer bus", error);
     })?;
+    let pipeline = capture.pipeline.clone();
 
-    let pipeline = element
-    .downcast::<gst::Pipeline>()
-    .map_err(|_| {
-        glib::Error::new(
-            gio::IOErrorEnum::Failed,
-            "Не удалось создать GStreamer Pipeline",
-        )
-    })?;
+    {
+        let mut state = app.borrow_mut();
+        state.capture_started = Some(Instant::now());
+        state.capture = Some(capture);
+    }
 
-    let source = pipeline
-    .by_name("source")
-    .expect("pipewiresrc element missing");
+    // GstPipeWireSrc can block inside set_state(Playing). Never call it from
+    // a D-Bus signal handler with Rc<RefCell<App>> borrowed.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("gstreamer-start".into())
+        .spawn(move || {
+            let status = pipeline
+                .set_state(gst::State::Playing)
+                .map(|value| format!("{value:?}"))
+                .map_err(|error| format!("GStreamer.set_state(Playing): {error}"));
+            let _ = sender.send(status);
+        })
+        .map_err(|error| format!("Не удалось создать поток запуска GStreamer: {error}"))?;
 
-    source.set_property("fd", raw_fd);
-    source.set_property("path", stream_id.to_string());
-
-    let sink = pipeline
-    .by_name("sink")
-    .expect("appsink element missing");
-
-    let frames = state.frames.clone();
-    let first_frame = state.first_frame.clone();
-
-    sink.connect(
-        "new-sample",
-        false,
-        move |values| {
-            let sink = values[0]
-            .get::<gst::Element>()
-            .expect("Invalid appsink element");
-
-            let sample = sink.emit_by_name::<Option<gst::Sample>>(
-                "pull-sample",
-                &[],
-            );
-
-            if let Some(sample) = sample {
-                frames.fetch_add(1, Ordering::Relaxed);
-
-                let mut first = first_frame
-                .lock()
-                .expect("First frame mutex poisoned");
-
-                if first.is_none() {
-                    *first = Some(Instant::now());
-
-                    println!("[OK] Первый видеокадр получен!");
-
-                    if let Some(caps) = sample.caps() {
-                        println!("[VIDEO] Формат: {caps}");
-                    }
-                }
-            }
-
-            Some(gst::FlowReturn::Ok.to_value())
-        },
-    );
-
-    let gst_bus = pipeline
-    .bus()
-    .expect("GStreamer bus missing");
-
-    let monitor = app.clone();
-
-    let watch = gst_bus
-    .add_watch_local(move |_, message| {
-        if let gst::MessageView::Error(error) = message.view() {
-            eprintln!(
-                "[ERROR] GStreamer: {}",
-                error.error()
-            );
-
-            monitor.borrow_mut().close();
+    let poll_app = app.clone();
+    let mut response_received = false;
+    let mut capture_timer_scheduled = false;
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if poll_app.borrow().stage == Stage::Finished {
+            return glib::ControlFlow::Break;
         }
-
+        if !response_received {
+            match receiver.try_recv() {
+                Ok(Ok(status)) => {
+                    println!("[STATE] set_state(Playing) вернул {status}");
+                    response_received = true;
+                }
+                Ok(Err(error)) => {
+                    poll_app.borrow_mut().fail("Запуск видеопотока", error);
+                    return glib::ControlFlow::Break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    poll_app.borrow_mut().fail(
+                        "Запуск видеопотока",
+                        "Поток GStreamer завершился без результата",
+                    );
+                    return glib::ControlFlow::Break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !capture_timer_scheduled && poll_app.borrow().stats.frames() > 0 {
+            capture_timer_scheduled = true;
+            let report_app = poll_app.clone();
+            println!("[INFO] Захват активен; измеряем FPS {CAPTURE_SECONDS} секунд");
+            glib::timeout_add_local_once(Duration::from_secs(CAPTURE_SECONDS), move || {
+                if report_app.borrow().stage != Stage::Finished {
+                    report_app.borrow_mut().finish();
+                }
+            });
+        }
+        let elapsed = poll_app
+            .borrow()
+            .capture_started
+            .map(|time| time.elapsed())
+            .unwrap_or_default();
+        if !capture_timer_scheduled && elapsed >= Duration::from_secs(CONNECTION_TIMEOUT_SECONDS) {
+            poll_app
+                .borrow_mut()
+                .fail("Тайм-аут", "GStreamer не завершил запуск за 45 секунд");
+            return glib::ControlFlow::Break;
+        }
         glib::ControlFlow::Continue
-    })
-    .map_err(|error| {
-        glib::Error::new(
-            gio::IOErrorEnum::Failed,
-            &error.to_string(),
-        )
-    })?;
-
-    state.bus_watch = Some(watch);
-    state.pipeline = Some(pipeline.clone());
-    state.started = Some(Instant::now());
-
-    pipeline
-    .set_state(gst::State::Playing)
-    .map_err(|error| {
-        glib::Error::new(
-            gio::IOErrorEnum::Failed,
-            &error.to_string(),
-        )
-    })?;
-
-    println!(
-        "[OK] Захват запущен. Продолжительность: {TEST_DURATION} секунд"
-    );
-
-    let timer = app.clone();
-
-    glib::timeout_add_local_once(
-        Duration::from_secs(TEST_DURATION),
-                                 move || {
-                                     timer.borrow_mut().report();
-                                 },
-    );
+    });
 
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    gst::init()?;
-
-    let bus = gio::bus_get_sync(
-        gio::BusType::Session,
-        gio::Cancellable::NONE,
-    )?;
-
-    let main_loop = MainLoop::new(None, false);
-
+    gst::init().map_err(|error| format!("GStreamer.init: {error}"))?;
+    let portal = portal::Portal::connect()?;
+    let main_loop = glib::MainLoop::new(None, false);
     let app = Rc::new(RefCell::new(App {
-        bus: bus.clone(),
-                                   main_loop: main_loop.clone(),
-
-                                   session: None,
-                                   request: None,
-                                   stage: "",
-
-                                   pipeline: None,
-                                   bus_watch: None,
-                                   pipewire_fd: None,
-
-                                   frames: Arc::new(AtomicU64::new(0)),
-                                   started: None,
-                                   first_frame: Arc::new(Mutex::new(None)),
-
-                                   stopped: false,
+        portal,
+        loop_: main_loop.clone(),
+        request: None,
+        stage: Stage::Create,
+        capture: None,
+        stats: Stats::new(),
+        capture_started: None,
     }));
 
-    let handler = app.clone();
-
-    bus.signal_subscribe(
+    let connection = app.borrow().portal.connection().clone();
+    let response_app = app.clone();
+    let _responses = connection.subscribe_to_signal(
         None,
         Some("org.freedesktop.portal.Request"),
-                         Some("Response"),
-                         None,
-                         None,
-                         gio::DBusSignalFlags::NONE,
-                         move |_, _, path, _, _, params| {
-                             let mut state = handler.borrow_mut();
-
-                             if state.request.as_deref() != Some(path) {
-                                 return;
-                             }
-
-                             let status: u32 = params
-                             .child_value(0)
-                             .get()
-                             .unwrap_or(u32::MAX);
-
-                             let result = params.child_value(1);
-                             let dict = VariantDict::new(Some(&result));
-
-                             if status != 0 {
-                                 eprintln!(
-                                     "[ERROR] Portal отклонил запрос: {status}"
-                                 );
-
-                                 state.close();
-                                 return;
-                             }
-
-                             let action = match state.stage {
-                                 "create" => {
-                                     let session = dict
-                                     .lookup_value("session_handle", None)
-                                     .and_then(|value| {
-                                         value.str().map(str::to_owned)
-                                     });
-
-                                     if let Some(session) = session {
-                                         state.session = Some(session);
-
-                                         println!("[OK] Сессия создана.");
-
-                                         state.select()
-                                     } else {
-                                         Err(glib::Error::new(
-                                             gio::IOErrorEnum::Failed,
-                                             "session_handle отсутствует",
-                                         ))
-                                     }
-                                 }
-
-                                 "select" => {
-                                     println!(
-                                         "[OK] Виртуальный источник выбран."
-                                     );
-
-                                     state.start()
-                                 }
-
-                                 "start" => {
-                                     println!(
-                                         "[OK] ScreenCast успешно запущен!"
-                                     );
-
-                                     let streams = dict.lookup_value(
-                                         "streams",
-                                         None,
-                                     );
-
-                                     if let Some(streams) = streams {
-                                         if streams.n_children() == 0 {
-                                             Err(glib::Error::new(
-                                                 gio::IOErrorEnum::Failed,
-                                                 "Portal вернул пустой streams",
-                                             ))
-                                         } else {
-                                             let stream_id: u32 = streams
-                                             .child_value(0)
-                                             .child_value(0)
-                                             .get()
-                                             .unwrap_or(0);
-
-                                             println!(
-                                                 "[DEBUG] Данные потока: {}",
-                                                 streams.child_value(0).print(true)
-                                             );
-
-                                             capture(
-                                                 handler.clone(),
-                                                     &mut state,
-                                                     stream_id,
-                                             )
-                                         }
-                                     } else {
-                                         Err(glib::Error::new(
-                                             gio::IOErrorEnum::Failed,
-                                             "streams отсутствует в ответе Portal",
-                                         ))
-                                     }
-                                 }
-
-                                 _ => Ok(()),
-                             };
-
-                             if let Err(error) = action {
-                                 eprintln!("[ERROR] {error}");
-
-                                 state.close();
-                             }
-                         },
+        Some("Response"),
+        None,
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let result = response_app
+                .borrow_mut()
+                .handle_response(signal.object_path, signal.parameters);
+            match result {
+                Ok(Some(node_id)) => {
+                    if let Err(error) = begin_capture(response_app.clone(), node_id) {
+                        response_app
+                            .borrow_mut()
+                            .fail("Подключение PipeWire", error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => response_app.borrow_mut().fail("Ответ Portal", error),
+            }
+        },
     );
 
-    println!(
-        "RuDeNoID Wireless Display — WD-005 / Rust"
+    let closed_app = app.clone();
+    let _closed = connection.subscribe_to_signal(
+        None,
+        Some("org.freedesktop.portal.Session"),
+        Some("Closed"),
+        None,
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let own_session =
+                closed_app.borrow().portal.session.as_deref() == Some(signal.object_path);
+            if own_session && closed_app.borrow().stage != Stage::Finished {
+                closed_app
+                    .borrow_mut()
+                    .fail("Portal", "Сессия закрыта окружением рабочего стола");
+            }
+        },
     );
 
-    app.borrow_mut().create()?;
-
+    println!("RuDeNoID Wireless Display — WD-005.2 / Rust");
+    let request = app.borrow().portal.create_session()?;
+    app.borrow_mut().request = Some(request);
     main_loop.run();
-
-    println!("[INFO] Тест завершён.");
-
+    println!("[INFO] Программа завершена");
     Ok(())
 }

@@ -664,6 +664,5 @@ dependencies = [
  "gio",
  "glib",
  "gstreamer",
- "libc",
  "uuid",
 ]
