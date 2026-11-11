@@ -11,4 +11,3 @@ glib = "0.21"
 gstreamer = "0.24"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
-
